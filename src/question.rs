@@ -1,196 +1,210 @@
-//! Question rendering and sequence layout.
+//! Typed questions and their rendering into an encoder sequence.
 //!
-//! The layout below must stay byte-for-byte with the reference `build_sequence` in
-//! `rl_common.py`: the encoder is trained against that exact geometry, so any drift changes
-//! what the head reads at the marker positions.
-//!
-//! ```text
-//! [CLS] <type> question: <instructions> [SEP]
-//!   [MASK] opt1 [MASK] opt2 ... [MASK] optK
-//! [SEP]
-//! <serialized state>
-//! [SEP]
-//! ```
+//! Layout, matching `build_sequence` in `rl_common.py`:
+//! `[CLS] <type> question: <instructions> [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] <state> [SEP]`
+//! Each option is preceded by a `[MASK]` marker; the head scores those marker positions.
 
-use crate::question::QType::*;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
-/// Options share `head_max_len`; the per-option shrink floor keeps a label readable after
-/// many-option questions are squeezed. Matches the reference's hardcoded cap and floor.
+/// Per-option text budget, in tokens. Matches the `[:48]` slice in the reference implementation.
 const MAX_OPTION_TOKENS: usize = 48;
 
-#[derive(Debug, Clone)]
-pub(crate) struct SpecialIds {
-    pub cls: u32,
-    pub sep: u32,
-    pub mask: u32,
-    pub pad: u32,
-    pub mask_text: String,
-}
-
-/// A typed question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub struct Question {
-    /// A stable answer key in the response and a `qid` for question-type embeddings.
-    pub id: String,
-    /// One of `choice`, `score`, `noul`.
-    #[serde(rename = "type")]
-    pub qtype: QType,
-    /// The full instruction to the model.
-    pub instructions: String,
-    /// `choice`: label → description; `score`/`noul`: optional label → description.
-    #[serde(default)]
-    pub criteria: Option<serde_json::Map<String, Value>>,
-    /// `score`: ordered level descriptions; `noul`: two-sided criteria.
-    #[serde(default = "Option::default")]
-    pub levels: Option<Vec<String>>,
-}
-
-impl Question {
-    /// Raw IDs are for humans; the tokenized label order is the reported distribution order.
-    pub fn choice(id: &str, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let labels: Vec<String> = labels.into_iter().map(Into::into).collect();
-        let criteria = labels
-            .into_iter()
-            .map(|l| (l, Value::Null))
-            .collect::<serde_json::Map<_, _>>();
-        Question {
-            id: id.to_string(),
-            qtype: QType::Choice,
-            instructions: String::new(),
-            criteria: Some(criteria),
-            levels: None,
-        }
-    }
-
-    /// `levels` are ordered low → high.
-    pub fn score(id: &str, levels: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Question {
-            id: id.to_string(),
-            qtype: QType::Score,
-            instructions: String::new(),
-            criteria: None,
-            levels: Some(levels.into_iter().map(Into::into).collect()),
-        }
-    }
-
-    /// Irony-optional. If `criteria` is empty, the default sides are `false` then `true`.
-    pub fn noul(id: &str, statement: impl Into<String>) -> Self {
-        Question {
-            id: id.to_string(),
-            instructions: statement.into(),
-            qtype: QType::Noul,
-            criteria: None,
-            levels: None,
-        }
-    }
-
-    /// The rendered option texts, in label order, exactly as the encoder sees them.
-    /// Mirror of `render_options` in `rl_common.py`.
-    pub fn render_options(&self) -> Result<Vec<String>> {
-        let opts = match self.qtype {
-            Choice => {
-                let map = self.criteria.clone().ok_or_else(|| {
-                    anyhow::anyhow!("choice question {id:?} has no `criteria`", id = self.id)
-                })?;
-                map.into_iter()
-                    .map(|(k, v)| {
-                        if v.is_null() || v.as_str().map(str::is_empty).unwrap_or(false) {
-                            k
-                        } else {
-                            format!("{k}: {v}")
-                        }
-                    })
-                    .collect()
-            }
-            Score => {
-                let levels = self.levels.clone().ok_or_else(|| {
-                    anyhow::anyhow!("score question {id:?} has no `levels`", id = self.id)
-                })?;
-                levels
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, l)| {
-                        if l.trim().is_empty() {
-                            format!("level {i}")
-                        } else {
-                            format!("level {i}: {l}")
-                        }
-                    })
-                    .collect()
-            }
-            Noul => {
-                let c = self.criteria.clone().unwrap_or_default();
-                if c.is_empty() {
-                    vec!["false".to_string(), "true".to_string()]
-                } else {
-                    let f = c.get("false").map(String::as_str).unwrap_or("");
-                    let t = c.get("true").map(String::as_str).unwrap_or("");
-                    vec![format!("false: {f}"), format!("true: {t}")]
-                }
-            }
-        };
-        Ok(opts)
-    }
-
-    /// The answer keys for a `choice` question, in label order.
-    pub fn choice_keys(&self) -> Result<Vec<String>> {
-        let map = self.criteria.clone().ok_or_else(|| {
-            anyhow::anyhow!("choice question {id:?} has no `criteria`", id = self.id)
-        })?;
-        Ok(map.into_keys().collect())
-    }
-
-    /// The `instructions` or, for `noul`, the statement.
-    pub fn instructions_text(&self) -> String {
-        if self.instructions.is_empty() {
-            self.id.clone()
-        } else {
-            self.instructions.clone()
-        }
-    }
-
-    /// The rendered legend for a `score` answer, in level order.
-    pub fn score_levels(&self) -> Vec<String> {
-        self.levels.clone().unwrap_or_default()
-    }
-}
-
-/// The three question types. Indices line up with the checkpoint's embedding rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QType {
-    Choice = 0,
-    Score = 1,
-    Noul = 2,
+    /// Pick one of N named options.
+    Choice,
+    /// Ordinal level; the answer is the expectation over level indices.
+    Score,
+    /// Boolean "does this statement hold"; the answer is P(true).
+    Noul,
 }
 
 impl QType {
-    pub fn index(&self) -> usize {
-        *self as usize
-    }
-    pub fn as_str(&self) -> &'static str {
+    pub fn index(self) -> usize {
         match self {
-            Choice => "choice",
-            Score => "score",
-            Noul => "noul",
+            QType::Choice => 0,
+            QType::Score => 1,
+            QType::Noul => 2,
         }
     }
+
     pub fn from_index(i: usize) -> Self {
         match i {
-            0 => Choice,
-            1 => Score,
-            _ => Noul,
+            0 => QType::Choice,
+            1 => QType::Score,
+            _ => QType::Noul,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QType::Choice => "choice",
+            QType::Score => "score",
+            QType::Noul => "noul",
         }
     }
 }
 
-/// The encoded sequence plus everything the model needs to read it back.
-#[derive(Debug, Clone)]
+/// A question in the request shape: `{"type", "instructions", "criteria"}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Question {
+    #[serde(rename = "type")]
+    pub qtype: QType,
+    /// Free text, or any JSON value (serialized compactly, as the reference does).
+    pub instructions: Value,
+    #[serde(default)]
+    pub criteria: Option<Value>,
+}
+
+impl Question {
+    pub fn choice<I, S>(instructions: &str, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let opts: Vec<Value> = options
+            .into_iter()
+            .map(|o| Value::String(o.into()))
+            .collect();
+        Self {
+            qtype: QType::Choice,
+            instructions: Value::String(instructions.to_string()),
+            criteria: Some(Value::Array(opts)),
+        }
+    }
+
+    pub fn score<I, S>(instructions: &str, levels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let levels: Vec<Value> = levels
+            .into_iter()
+            .map(|o| Value::String(o.into()))
+            .collect();
+        Self {
+            qtype: QType::Score,
+            instructions: Value::String(instructions.to_string()),
+            criteria: Some(Value::Array(levels)),
+        }
+    }
+
+    pub fn noul(instructions: &str) -> Self {
+        Self {
+            qtype: QType::Noul,
+            instructions: Value::String(instructions.to_string()),
+            criteria: None,
+        }
+    }
+
+    pub(crate) fn instructions_text(&self) -> String {
+        match &self.instructions {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The labels a `choice` answer is reported against, in option order.
+    pub(crate) fn choice_keys(&self) -> Result<Vec<String>> {
+        match &self.criteria {
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Ok(s.clone()),
+                    other => Ok(other.to_string()),
+                })
+                .collect(),
+            Some(Value::Object(m)) => Ok(m.keys().cloned().collect()),
+            _ => bail!("choice question needs `criteria` as a list or an object"),
+        }
+    }
+
+    /// Option texts in label-index order, as the model sees them.
+    pub fn render_options(&self) -> Result<Vec<String>> {
+        match self.qtype {
+            QType::Choice => match &self.criteria {
+                Some(Value::Array(a)) => Ok(a
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect()),
+                Some(Value::Object(m)) => Ok(m
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Value::Null => k.clone(),
+                        Value::String(s) if s.is_empty() => k.clone(),
+                        Value::String(s) => format!("{k}: {s}"),
+                        other => format!("{k}: {other}"),
+                    })
+                    .collect()),
+                _ => bail!("choice question needs `criteria` as a list or an object"),
+            },
+            QType::Score => match &self.criteria {
+                Some(Value::Array(a)) => Ok(a
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let c = match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        format!("level {i}: {c}")
+                    })
+                    .collect()),
+                _ => bail!("score question needs `criteria` as a list of levels"),
+            },
+            QType::Noul => {
+                let empty = Map::new();
+                let m = match &self.criteria {
+                    Some(Value::Object(m)) => m,
+                    _ => &empty,
+                };
+                let side = |k: &str, default: &str| -> String {
+                    match m.get(k) {
+                        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+                        _ => default.to_string(),
+                    }
+                };
+                Ok(vec![
+                    format!(
+                        "false: {}",
+                        side("false", "no, the statement does not hold")
+                    ),
+                    format!("true: {}", side("true", "yes, the statement holds")),
+                ])
+            }
+        }
+    }
+
+    /// The legend for a `score` answer: level index -> level description.
+    pub(crate) fn score_levels(&self) -> Vec<String> {
+        match &self.criteria {
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The state to decide over: free text, or any JSON document.
+pub fn serialize_state(state: &Value) -> String {
+    match state {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) struct Encoded {
     pub ids: Vec<u32>,
     pub markers: Vec<usize>,
@@ -202,8 +216,13 @@ pub(crate) struct Encoded {
     pub labels_clipped: usize,
 }
 
-// The encoder is byte-sensitive (it scores individual markers), so the layout is fixed here:
-// no XML, no peer instructions. Keep the Cargo.toml description in sync with this.
+pub(crate) struct SpecialIds {
+    pub cls: u32,
+    pub sep: u32,
+    pub mask: u32,
+    pub pad: u32,
+    pub mask_text: String,
+}
 
 fn encode_plain(tok: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     tok.encode(text, false)
@@ -318,16 +337,6 @@ pub(crate) fn build_sequence(
         opts_sep,
         labels_clipped,
     })
-}
-
-// The state is dense prose; the encoder has never seen our internal docstrings.
-// Serialize JSON with a compact, deterministic ordering so layout stays stable.
-// Encode the state as the model expects: a JSON document when it is one, else the raw text.
-fn serialize_state(state: &Value) -> String {
-    match state {
-        Value::String(s) => s.clone(),
-        _ => serde_json::to_string(state).unwrap_or_default(),
-    }
 }
 
 #[cfg(test)]
